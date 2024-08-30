@@ -2,8 +2,11 @@ using System.Text.Json.Serialization;
 using HelpDesk.Api.Core.Marten;
 using HelpDesk.Api.Incidents;
 using HelpDesk.Api.Requests;
-using HelpDesk.Api.Core.Http;
 using Marten;
+using Marten.Events.Daemon.Coordination;
+using Marten.Events.Daemon.Resiliency;
+using Marten.Events.Projections;
+using Marten.Pagination;
 using Marten.Schema.Identity;
 using Microsoft.AspNetCore.Mvc;
 using Weasel.Core;
@@ -20,15 +23,19 @@ builder.Services.Configure<Microsoft.AspNetCore.Mvc.JsonOptions>(o =>
     o.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 
 builder.Services.AddMarten(options =>
-{
-    options.Connection(builder.Configuration.GetConnectionString("Events")!);
-    options.UseSystemTextJsonForSerialization();
-
-    if (builder.Environment.IsDevelopment())
     {
-        options.AutoCreateSchemaObjects = AutoCreate.CreateOnly;
-    }
-});
+        options.Connection(builder.Configuration.GetConnectionString("Events")!);
+        options.UseSystemTextJsonForSerialization();
+
+        if (builder.Environment.IsDevelopment())
+        {
+            options.AutoCreateSchemaObjects = AutoCreate.CreateOrUpdate;
+        }
+
+        options.Projections.Add<IncidentShortInfoProjection>(ProjectionLifecycle.Inline);
+    })
+    .UseLightweightSessions()
+    .AddAsyncDaemon(DaemonMode.Solo);
 
 var app = builder.Build();
 
@@ -37,6 +44,14 @@ if (app.Environment.IsDevelopment())
     app.UseSwagger();
     app.UseSwaggerUI();
 }
+
+app.MapPost("projections/{projectionName}/reset",
+        async (IProjectionCoordinator projectionCoordinator, string projectionName) =>
+        {
+            var daemon = projectionCoordinator.DaemonForMainDatabase();
+            await daemon.RebuildProjectionAsync(projectionName, CancellationToken.None);
+        })
+    .WithTags("Projection");
 
 app.MapPost("customers/{customerId:guid}/incidents",
     async (
@@ -56,12 +71,12 @@ app.MapPost("customers/{customerId:guid}/incidents",
         return Created($"incidents/{incidentId}", incidentId);
     }).WithTags("Customer");
 
-app.MapPut("agents/{agentId:guid}/incidents/{incidentId:guid}/category",
+app.MapPut("agents/{agentId:guid}/incidents/{incidentId:guid}/{version:int}/category",
     async (
         IDocumentSession documentSession,
         Guid incidentId,
         Guid agentId,
-        [FromHeader(Name = "If-Match")] string eTag,
+        int version,
         CategoryIncidentRequest body,
         CancellationToken ct) =>
     {
@@ -69,17 +84,17 @@ app.MapPut("agents/{agentId:guid}/incidents/{incidentId:guid}/category",
 
         await documentSession.GetAndUpdate<Incident>(
             incidentId,
-            eTag.ToExpectedVersion(),
+            version,
             current => Handle(current, new CategoriseIncident(current.Id, category, agentId)),
             ct);
     }).WithTags("Agent");
 
-app.MapPut("agents/{agentId:guid}/incidents/{incidentId:guid}/priority",
+app.MapPut("agents/{agentId:guid}/incidents/{incidentId:guid}/{version:int}/priority",
     async (
         IDocumentSession documentSession,
         Guid incidentId,
         Guid agentId,
-        [FromHeader(Name = "If-Match")] string eTag,
+        int version,
         PriorityIncidentRequest body,
         CancellationToken ct) =>
     {
@@ -87,25 +102,46 @@ app.MapPut("agents/{agentId:guid}/incidents/{incidentId:guid}/priority",
 
         await documentSession.GetAndUpdate<Incident>(
             incidentId,
-            eTag.ToExpectedVersion(),
+            version,
             current => Handle(current, new PrioritiseIncident(current.Id, priority, agentId)),
             ct);
     }).WithTags("Agent");
 
-app.MapPut("agents/{agentId:guid}/incidents/{incidentId:guid}/assign", async (
-    IDocumentSession documentSession,
-    Guid incidentId,
-    Guid agentId,
-    [FromHeader(Name = "If-Match")] string eTag,
-    AssignIncidentRequest body,
-    CancellationToken ct
-) =>
-{
-    await documentSession.GetAndUpdate<Incident>(
-        incidentId,
-        eTag.ToExpectedVersion(),
-        current => Handle(current, new AssignAgent(current.Id, agentId, body.AssignedBy)),
-        ct);
-}).WithTags("Agent");
+app.MapPut("agents/{agentId:guid}/incidents/{incidentId:guid}/{version:int}/assign",
+    async (
+        IDocumentSession documentSession,
+        Guid incidentId,
+        Guid agentId,
+        int version,
+        AssignIncidentRequest body,
+        CancellationToken ct
+    ) =>
+    {
+        await documentSession.GetAndUpdate<Incident>(
+            incidentId,
+            version,
+            current => Handle(current, new AssignAgent(current.Id, agentId, body.AssignedBy)),
+            ct);
+    }).WithTags("Agent");
+
+app.MapGet("customers/{customerId:guid}/incidents",
+        (
+            IQuerySession querySession,
+            Guid customerId,
+            [FromQuery] int? pageNumber,
+            [FromQuery] int? pageSize,
+            CancellationToken ct
+        ) => querySession.Query<IncidentShortInfo>()
+            .Where(i => i.CustomerId == customerId)
+            .ToPagedListAsync(pageNumber ?? 1, pageSize ?? 10, ct))
+    .WithTags("Customer");
+
+app.MapGet("incidents/{incidentId:guid}",
+        (
+            IDocumentSession documentSession,
+            Guid incidentId,
+            CancellationToken ct
+        ) => documentSession.Query<IncidentShortInfo>().FirstOrDefaultAsync(i => i.Id == incidentId, ct))
+    .WithTags("Customer");
 
 app.Run();
